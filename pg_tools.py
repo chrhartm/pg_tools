@@ -185,7 +185,12 @@ class PGWrangler(object):
 
         # return true if the result of the query either has a length greater than
         # 1 or has a first value of something other than [None]
-        return not (len(results) == 1 and results[0].values() == [None])
+        if len(results) == 1:
+            return results[0].values() != [None]
+        elif len(results) < 1:
+            return False
+        else:
+            return True
 
     def check_column_value(self, f, column, table, schema):
         """
