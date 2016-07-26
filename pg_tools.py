@@ -165,13 +165,13 @@ class PGWrangler(object):
 
     def check_column_is_not_null(self, column, table, schema):
         """
-        Check if column exists
+        Check if column is not just null
 
         :param str column: column
         :param str table: table
         :param str schema: schema
         :rtype: bool
-        :returns: true if column exists
+        :returns: true if column has values other than null
 
         """
         sql_query = """
