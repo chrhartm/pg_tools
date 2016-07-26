@@ -163,6 +163,30 @@ class PGWrangler(object):
         except:
             return False
 
+    def check_column_is_not_null(self, column, table, schema):
+        """
+        Check if column exists
+
+        :param str column: column
+        :param str table: table
+        :param str schema: schema
+        :rtype: bool
+        :returns: true if column exists
+
+        """
+        sql_query = """
+                    select distinct "%s"
+                    from %s.%s
+                    """ % (column, schema, table)
+        try:
+            results = self.execute(sql_query)
+        except:
+            return False
+
+        # return true if the result of the query either has a length greater than
+        # 1 or has a first value of something other than [None]
+        return not (len(results) == 1 and results[0].values() == [None])
+
     def check_column_value(self, f, column, table, schema):
         """
         Check if a column confirms with a pattern
@@ -569,6 +593,24 @@ class PGColumnTarget(PostgresTarget):
         return self.pgw.check_column_exists(self.column, self.table,
                                             self.schema)
 
+class PGNonNullColTableTarget(PostgresTarget):
+    """
+    Postgres target that checks the existence of a column
+
+    :param str column: column
+    :param str table: table
+    :param str schema: schema
+
+    """
+
+    def __init__(self, column, table, schema):
+        self.schema = schema
+        self.table = table
+        self.column = column
+
+    def exists(self):
+        return self.pgw.check_column_is_not_null(self.column, self.table,
+                                            self.schema)
 
 class PGColValTarget(PostgresTarget):
     """
