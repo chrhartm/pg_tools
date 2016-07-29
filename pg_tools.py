@@ -208,7 +208,7 @@ class PGWrangler(object):
         return output
 
     def recreate_schema(self, schema_name):
-        """ 
+        """
         Create a new schema and delete it if already exists
 
         :param str schema_name: The name of the schema to create
@@ -326,6 +326,30 @@ class PGWrangler(object):
                "where a.{p[col]} = b.{p[col]} "
                "and a.ctid <> b.ctid").format(p=p)
         self.execute(sql)
+
+    def check_table_has_nrows(self,table,schema,nrows):
+        """
+        Check if a table has at least nrows data.
+
+        :param str table: the table
+        :param str schema: the schema of the table
+        :param nrows int: number of rows expected
+        :rtype bool:
+        """
+        conn = self.engine.connect()
+
+        sql_query = """
+                    select count(*)
+                    from %s.%s
+                    """%(schema,table)
+
+        try:
+            to_return = self.execute(sql_query)[0][0]>=nrows
+        except:
+            to_return = False
+
+        conn.close()
+        return to_return
 
     def get_column_type(self, column, table, schema):
         """
@@ -540,7 +564,7 @@ class PGWrangler(object):
                   left_schema, right_schema, new_table, cond=None,
                   append_names=True):
         """
-        left join between two tables, taking only unique column names 
+        left join between two tables, taking only unique column names
 
         :param str left_table: name of the left table
         :param str right_table: name of the right table
@@ -551,7 +575,7 @@ class PGWrangler(object):
         :param str new_table: name of the new table
         :param (str,(str,str)) cond: name and (min,max) pair of column in left
                                      table to condition on
-        :param bool append_names: append name of RIGHT table to its column 
+        :param bool append_names: append name of RIGHT table to its column
                                   names in joint table
 
         """
@@ -642,7 +666,7 @@ class PostgresTarget(luigi.target.Target):
 
 
 class PGSchemaTarget(PostgresTarget):
-    """  
+    """
     Postgres target that checks the existence of a schema
 
     :param str schema: the schema
@@ -656,7 +680,7 @@ class PGSchemaTarget(PostgresTarget):
 
 
 class PGTableTarget(PostgresTarget):
-    """ 
+    """
     Postgres target that checks the existence of a table
 
     :param str table: the table
@@ -676,6 +700,20 @@ class PGTableTarget(PostgresTarget):
         else:
             return existence
 
+class PGNonEmptyTableTarget(PostgresTarget):
+    """
+    Postgres target that checks the existence of a table
+
+    :param str table: the table
+    :param str schema: the schema
+
+    """
+    def __init__(self,table,schema):
+        self.schema = schema
+        self.table = table
+
+    def exists(self):
+        return self.pgw.check_table_has_nrows(self.table,self.schema, nrows=1)
 
 class PGColumnTarget(PostgresTarget):
     """
@@ -693,12 +731,12 @@ class PGColumnTarget(PostgresTarget):
         self.column = column
 
     def exists(self):
-        return self.pgw.check_column_exists(self.column, self.table, 
+        return self.pgw.check_column_exists(self.column, self.table,
                                             self.schema)
 
 
 class PGColValTarget(PostgresTarget):
-    """ 
+    """
     Postgres target that checks a value in a given table
 
     :param func f: a function that checks a column value and returns bool
