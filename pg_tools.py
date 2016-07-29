@@ -1,10 +1,122 @@
 import sqlalchemy
 import collections
 import os
+import sys
+import time
 import subprocess
 import luigi
 import luigi.target
 from luigi import configuration
+import logging
+
+
+import pandas.io.sql
+class PgSQLDatabase(pandas.io.sql.SQLDatabase):
+    """
+    This class is modified from util.py in https://github.com/dssg/drain/
+    """
+    import tempfile
+    def to_sql(self, frame, name, env, if_exists='fail', index=True,
+               index_label=None, schema=None, chunksize=None, dtype=None, 
+               pk=None, prefixes=None, raise_on_error=True):
+        """
+        Write records stored in a DataFrame to a SQL database.
+
+        Parameters
+        ----------
+        frame : DataFrame
+        name : string
+            Name of SQL table
+        if_exists : {'fail', 'replace', 'append'}, default 'fail'
+            - fail: If table exists, do nothing.
+            - replace: If table exists, drop it, recreate it, and insert data.
+            - append: If table exists, insert data. Create if does not exist.
+        index : boolean, default True
+            Write DataFrame index as a column
+        index_label : string or sequence, default None
+            Column label for index column(s). If None is given (default) and
+            `index` is True, then the index names are used.
+            A sequence should be given if the DataFrame uses MultiIndex.
+        schema : string, default None
+            Name of SQL schema in database to write to (if database flavor
+            supports this). If specified, this overwrites the default
+            schema of the SQLDatabase object.
+        chunksize : int, default None
+            If not None, then rows will be written in batches of this size at a
+            time.  If None, all rows will be written at once.
+        dtype : dict of column name to SQL type, default None
+            Optional specifying the datatype for columns. The SQL type should
+            be a SQLAlchemy type.
+        pk: name of column(s) to set as primary keys
+        """
+        table = pandas.io.sql.SQLTable(name, self, frame=frame, index=index,
+                                       if_exists=if_exists,
+                                       index_label=index_label,
+                                       schema=schema, dtype=dtype)
+        existed = table.exists()
+        table.create()
+        replaced = existed and if_exists=='replace'
+
+        table_name=name
+        if schema is not None:
+            table_name = schema + '.' + table_name
+
+        if pk is not None and ( (not existed) or replaced):
+            if isinstance(pk, str):
+                pks = pk
+            else:
+                pks = ", ".join(pk)
+            sql = ("ALTER TABLE {table_name} "
+                   "ADD PRIMARY KEY ({pks})").format(table_name=table_name,
+                                                     pks=pks)
+            self.execute(sql)
+
+
+        from subprocess import Popen, PIPE, STDOUT
+
+        columns = (frame.index.names + list(frame.columns) 
+                   if index else frame.columns)
+        columns = str.join(",", map(lambda c: '"' + c + '"', columns))
+
+        sql = ("COPY {table_name} ({columns}) FROM STDIN WITH "
+               "(FORMAT CSV, HEADER TRUE)").format(table_name=table_name,
+                                                   columns=columns)
+        p = Popen(['psql', '-c', sql], stdout=PIPE, stdin=PIPE, stderr=STDOUT,
+                  env=env)
+        frame.to_csv(p.stdin, index=index)
+
+        psql_out = p.communicate()[0]
+        logging.info(psql_out.decode()),
+
+        r = p.wait()
+        if raise_on_error and (r > 0):
+            sys.exit(r)
+
+        return r
+
+    def read_table(self, name, schema=None):
+        table_name=name
+        if schema is not None:
+            table_name = schema + '.' + table_name
+
+        return self.read_query('select * from %s' % table_name)
+
+    def read_sql(self, query, env, raise_on_error=True, **kwargs):
+        from subprocess import Popen, PIPE, STDOUT
+
+        sql = "COPY (%s) TO STDOUT WITH (FORMAT CSV, HEADER TRUE)" % query
+        p = Popen(['psql', '-c', sql], stdout=PIPE, stdin=PIPE, stderr=STDOUT,
+                  env=env)
+        df = pd.read_csv(p.stdout, **kwargs)
+
+        psql_out = p.communicate()
+        logging.info(psql_out[0].decode(),)
+
+        r = p.wait()
+        if raise_on_error and (r > 0):
+            sys.exit(r)
+
+        return df
 
 
 def create_engine(dbitems=None, path_to_default_profile='../default_profile'):
@@ -38,7 +150,8 @@ class PGWrangler(object):
     Wraps functions to wrangle postgres databases
     """
 
-    def __init__(self, dbitems=None, path_to_default_profile='../default_profile'):
+    def __init__(self, dbitems=None, 
+                 path_to_default_profile='../default_profile'):
         """
         Constructor
 
@@ -53,6 +166,17 @@ class PGWrangler(object):
         self.pg_env = os.environ.copy()
         for key in dbitems:
             self.pg_env[key] = dbitems[key]
+        self.pgdb = PgSQLDatabase(self.engine)
+
+    def df_to_pg(self, df, table, schema, **kwargs):
+        self.pgdb.to_sql(df, table, self.pg_env, schema=schema, **kwargs)
+
+    def create_pg_env(self):
+        default_env = os.environ.copy()
+        for key in self.pg_env:
+            if not key in default_env:
+                os.environ[key]=self.pg_env[key]
+
 
     def shell(self, cmd):
         """
@@ -184,6 +308,25 @@ class PGWrangler(object):
         conn.close()
         return f(sample)
 
+    def delete_duplicates(self, column, table, schema):
+        """ Delete duplicate rows
+
+        :param str column: column to identify duplicates
+        :param str table: table
+        :param str schema: schema
+
+        """
+        p = {'table':schema+'.'+table,
+             'col':column}
+        sql = ("delete from {p[table]} a using( "
+               "select min(ctid) as ctid, {p[col]} "
+               "from {p[table]} "
+               "group by {p[col]} having count(*) > 1 "
+               ") b "
+               "where a.{p[col]} = b.{p[col]} "
+               "and a.ctid <> b.ctid").format(p=p)
+        self.execute(sql)
+
     def check_table_has_nrows(self,table,schema,nrows):
         """
         Check if a table has at least nrows data.
@@ -231,6 +374,23 @@ class PGWrangler(object):
             return self.execute(sql)[0][0]
         except:
             return None
+    
+    def get_n_cols(self, table, schema):
+        """
+        Returns the number of columns in a table
+
+        :param str table: table
+        :param str column: column
+        :returns: the number of oclumns
+        :rtype: int
+        """
+        sql = ("select count(*) "
+               "from information_schema.columns "
+               "where table_name='%s' "
+               "and table_schema='%s' ")%(table, schema)
+        return self.execute(sql)[0][0]
+
+
 
     def drop_table(self, table, schema):
         """
@@ -241,7 +401,7 @@ class PGWrangler(object):
 
         """
         conn = self.engine.connect()
-        conn.execute("DROP TABLE " + schema + "." + table)
+        conn.execute("DROP TABLE IF EXISTS " + schema + "." + table)
         conn.close()
 
     # ## Copy tables to schema processing
@@ -525,15 +685,20 @@ class PGTableTarget(PostgresTarget):
 
     :param str table: the table
     :param str schema: the schema
-
+    :param bool inverse: check that it doesn't exist
     """
 
-    def __init__(self, table, schema):
+    def __init__(self, table, schema, inverse=False):
         self.schema = schema
         self.table = table
+        self.inverse = inverse
 
     def exists(self):
-        return self.pgw.check_table_exists(self.table, self.schema)
+        existence =  self.pgw.check_table_exists(self.table, self.schema) 
+        if self.inverse:
+            return not existence
+        else:
+            return existence
 
 class PGNonEmptyTableTarget(PostgresTarget):
     """
@@ -613,6 +778,89 @@ class PGColTypeTarget(PostgresTarget):
         return self.pgw.get_column_type(self.column, self.table,
                                         self.schema) == self.dtype
 
+class PGNColumnsTarget(PostgresTarget):
+    """
+    Postgres target that checks the number of columns
+
+    :param int N: number of required columns
+    :param str table: table
+    :param str schema: schema
+    """
+
+    def __init__(self, N, table, schema):
+        self.N = N
+        self.table = table
+        self.schema = schema
+
+    def exists(self):
+        return self.pgw.get_n_cols(self.table, self.schema) == self.N
+
+ 
+class PGNoDuplicatesTarget(PostgresTarget):
+    """ Checks for duplicates
+
+    :param str column: column to identify duplicates
+    :param str table: table
+    :param str schema: schema
+    """
+    
+    def __init__(self, column, table, schema):
+        self.column = column
+        self.table = table
+        self.schema = schema
+
+    def exists(self):
+        full_count = self.pgw.execute("select count(%s) "
+                                      "from %s.%s"%(self.column, 
+                                      self.schema, self.table))[0][0]
+        distinct_count = self.pgw.execute("select count(distinct %s) "
+                                          "from %s.%s"%(self.column,
+                                          self.schema, self.table))[0][0]
+        return full_count == distinct_count
+
+class FileOlderTarget(luigi.target.Target):
+    """ Cheks that one file was more recently modified than another file
+
+    :param str old_file: the file assumed to be older
+    :param str young_file: the file assumed to be more recent
+    """
+    
+    def __init__(self, old_file, young_file):
+        self.old_file = old_file
+        self.young_file = young_file
+
+    def exists(self):
+        try:
+            oldtime = time.ctime(os.path.getmtime(self.old_file))
+            youngtime = time.ctime(os.path.getmtime(self.young_file))
+            return oldtime < youngtime
+        except:
+            return False
+
+class DeleteDuplicates(PostgresTask):
+    """ Deletes duplicate rows
+
+    :param str column: column to identify duplicates
+    :param str table: table
+    :param str column: column
+    :param [luigi.Task] required: list of required tasks
+    """
+
+    column = luigi.Parameter()
+    table = luigi.Parameter()
+    schema = luigi.Parameter()
+    required = luigi.Parameter(default=[])
+
+    def requires(self):
+        for x in self.required:
+            yield x
+
+    def run(self):
+        self.pgw.delete_duplicates(self.column, self.table, self.schema)
+
+    def output(self):
+        return PGNoDuplicatesTarget(self.column, self.table, self.schema)
+
 
 class CreateSchema(PostgresTask):
     """ Task to create a postgres schema
@@ -631,6 +879,23 @@ class CreateSchema(PostgresTask):
     def output(self):
         return PGSchemaTarget(self.schema)
 
+class DropTable(PostgresTask):
+    """
+    Drops a table if it exists
+
+    :param str table: table
+    :param str schema: schema
+    """
+
+    table = luigi.Parameter()
+    schema = luigi.Parameter()
+
+    def run(self):
+        self.pgw.drop_table(table=self.table, schema=self.schema)
+
+    def output(self):
+        return PGTableTarget(table=self.table, schema=self.schema,
+                             inverse=True)
 
 class CastColumn(PostgresTask):
     """
